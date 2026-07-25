@@ -1,0 +1,48 @@
+name: ${COMPOSE_PROJECT_NAME:-xiaobai-one}
+
+services:
+  api:
+    build:
+      context: ../apps/api
+    container_name: ${COMPOSE_PROJECT_NAME:-xiaobai-one}-api
+    environment:
+      XIAOBAI_DATA_DIR: /data
+      XIAOBAI_DB_PATH: /data/xiaobai.db
+      XIAOBAI_SECRET_KEY: ${XIAOBAI_SECRET_KEY}
+      XIAOBAI_BOOTSTRAP_ADMIN_USERNAME: ${XIAOBAI_BOOTSTRAP_ADMIN_USERNAME}
+      XIAOBAI_BOOTSTRAP_ADMIN_PASSWORD: ${XIAOBAI_BOOTSTRAP_ADMIN_PASSWORD}
+      XIAOBAI_BOOTSTRAP_ADMIN_DISPLAY_NAME: ${XIAOBAI_BOOTSTRAP_ADMIN_DISPLAY_NAME}
+      XIAOBAI_ENGINE_MODE: ${XIAOBAI_ENGINE_MODE:-mock}
+      XIAOBAI_AINOVEL_IMAGE: ${XIAOBAI_AINOVEL_IMAGE:-ghcr.io/voocel/ainovel-cli:latest}
+      XIAOBAI_AINOVEL_NETWORK: ${XIAOBAI_AINOVEL_NETWORK:-}
+      XIAOBAI_ACTIVE_RUNS_PER_OPERATOR: ${XIAOBAI_ACTIVE_RUNS_PER_OPERATOR:-1}
+      XIAOBAI_ACTIVE_RUNS_GLOBAL: ${XIAOBAI_ACTIVE_RUNS_GLOBAL:-2}
+      XIAOBAI_CORS_ORIGIN: '*'
+    volumes:
+      - ${XIAOBAI_DATA_ROOT:-./data}:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - xiaobai
+
+  web:
+    build:
+      context: ../apps/web
+    container_name: ${COMPOSE_PROJECT_NAME:-xiaobai-one}-web
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${XIAOBAI_WEB_PORT:-3210}:80"
+    restart: unless-stopped
+    networks:
+      - xiaobai
+
+networks:
+  xiaobai:
+    name: ${COMPOSE_PROJECT_NAME:-xiaobai-one}-net
