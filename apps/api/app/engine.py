@@ -10,7 +10,7 @@ import docker
 from docker.errors import DockerException, NotFound
 
 from .config import settings
-from .db import json_dumps, json_loads, transaction, utcnow
+from .db import json_dumps, transaction, utcnow
 from .security import decrypt_text
 
 
@@ -23,6 +23,17 @@ class EngineManager:
                 self._docker = docker.from_env()
             except DockerException:
                 self._docker = None
+
+    def work_dir(self, work_id: str) -> Path:
+        path = settings.works_dir / work_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def output_root(self, work_id: str) -> Path:
+        work_dir = self.work_dir(work_id)
+        if settings.engine_mode == "ainovel":
+            return work_dir / "workspace" / "output" / "novel"
+        return work_dir / "output" / "novel"
 
     def start(self, work_id: str, run_id: str, prompt: str, resume: bool = False) -> None:
         if settings.engine_mode == "ainovel":
@@ -73,7 +84,7 @@ class EngineManager:
                     "UPDATE runs SET status='completed', ended_at=?, updated_at=? WHERE id=?",
                     (utcnow(), utcnow(), run["id"]),
                 )
-                progress_path = self._work_dir(work_id) / "output" / "novel" / "progress.json"
+                progress_path = self.output_root(work_id) / "progress.json"
                 completed = 0
                 if progress_path.exists():
                     try:
@@ -109,8 +120,7 @@ class EngineManager:
         thread.start()
 
     def _mock_worker(self, work_id: str, run_id: str, prompt: str, stop_event: threading.Event, resume: bool) -> None:
-        work_dir = self._work_dir(work_id)
-        output_dir = work_dir / "output" / "novel"
+        output_dir = self.output_root(work_id)
         chapters_dir = output_dir / "chapters"
         output_dir.mkdir(parents=True, exist_ok=True)
         chapters_dir.mkdir(parents=True, exist_ok=True)
@@ -182,7 +192,7 @@ class EngineManager:
     def _start_ainovel(self, work_id: str, run_id: str, prompt: str, resume: bool = False) -> None:
         if not self._docker:
             raise RuntimeError("Docker daemon 不可用，无法启动 ainovel-cli")
-        work_dir = self._work_dir(work_id)
+        work_dir = self.work_dir(work_id)
         config_dir = work_dir / "config"
         workspace_dir = work_dir / "workspace"
         config_dir.mkdir(parents=True, exist_ok=True)
@@ -207,7 +217,7 @@ class EngineManager:
         }
         if settings.ainovel_network:
             kwargs["network"] = settings.ainovel_network
-        container = self._docker.containers.run(command=command, **kwargs)
+        self._docker.containers.run(command=command, **kwargs)
         with transaction() as conn:
             conn.execute(
                 "UPDATE runs SET status='starting', container_name=?, meta_json=?, started_at=COALESCE(started_at, ?), updated_at=? WHERE id=?",
@@ -261,11 +271,6 @@ class EngineManager:
         if cred["base_url"]:
             payload["providers"][alias]["base_url"] = cred["base_url"]
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def _work_dir(self, work_id: str) -> Path:
-        path = settings.works_dir / work_id
-        path.mkdir(parents=True, exist_ok=True)
-        return path
 
 
 engine_manager = EngineManager()
