@@ -38,7 +38,7 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${XIAOBAI_WEB_PORT:-3210}:80"
+      - "${XIAOBAI_WEB_BIND:-127.0.0.1}:${XIAOBAI_WEB_PORT:-3210}:80"
     restart: unless-stopped
     networks:
       - xiaobai
