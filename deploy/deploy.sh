@@ -9,6 +9,17 @@ if [[ ! -f .env ]]; then
   exit 1
 fi
 
+if [[ -z "${XIAOBAI_HOST_DATA_DIR:-}" ]]; then
+  data_root=$(awk -F= "/^XIAOBAI_DATA_ROOT=/{print \$2}" .env)
+  data_root=${data_root:-./data}
+  if [[ "$data_root" == /* ]]; then
+    export XIAOBAI_HOST_DATA_DIR="$data_root"
+  else
+    export XIAOBAI_HOST_DATA_DIR="$ROOT_DIR/${data_root#./}"
+  fi
+fi
+
+echo "[xiaobai] using host data dir: $XIAOBAI_HOST_DATA_DIR"
 echo "[xiaobai] docker compose build"
 docker compose --env-file .env -f docker-compose.yml build
 

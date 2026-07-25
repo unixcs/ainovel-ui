@@ -6,7 +6,6 @@ import threading
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, Iterator
 
 from .config import settings
@@ -53,6 +52,16 @@ def transaction() -> Iterator[sqlite3.Connection]:
             raise
         finally:
             conn.close()
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {row[1] for row in rows}
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    if column not in table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 def init_db() -> None:
@@ -130,7 +139,23 @@ def init_db() -> None:
             );
             """
         )
+        migrate_db(conn)
         ensure_bootstrap_admin(conn)
+
+
+def migrate_db(conn: sqlite3.Connection) -> None:
+    ensure_column(conn, "users", "must_change_password", "must_change_password INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "users", "password_changed_at", "password_changed_at TEXT")
+    ensure_column(conn, "users", "last_login_at", "last_login_at TEXT")
+
+    ensure_column(conn, "credentials", "last_test_status", "last_test_status TEXT")
+    ensure_column(conn, "credentials", "last_test_message", "last_test_message TEXT")
+    ensure_column(conn, "credentials", "last_tested_at", "last_tested_at TEXT")
+
+    conn.execute(
+        "UPDATE users SET must_change_password=1 WHERE role='admin' AND username=? AND COALESCE(password_changed_at,'')=''",
+        (settings.bootstrap_admin_username,),
+    )
 
 
 def ensure_bootstrap_admin(conn: sqlite3.Connection) -> None:
@@ -140,8 +165,11 @@ def ensure_bootstrap_admin(conn: sqlite3.Connection) -> None:
     now = utcnow()
     conn.execute(
         """
-        INSERT INTO users (id, username, display_name, password_hash, role, active, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'admin', 1, ?, ?)
+        INSERT INTO users (
+          id, username, display_name, password_hash, role, active,
+          must_change_password, password_changed_at, last_login_at, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, 'admin', 1, 1, NULL, NULL, ?, ?)
         """,
         (
             new_id("usr"),

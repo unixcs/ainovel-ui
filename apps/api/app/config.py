@@ -11,6 +11,7 @@ class Settings:
     app_name: str = "小白一号 API"
     data_dir: Path = Path(os.getenv("XIAOBAI_DATA_DIR", "/data"))
     db_path: Path = Path(os.getenv("XIAOBAI_DB_PATH", "/data/xiaobai.db"))
+    host_data_dir: Path = Path(os.getenv("XIAOBAI_HOST_DATA_DIR", os.getenv("XIAOBAI_DATA_DIR", "/data")))
     secret_key: str = os.getenv("XIAOBAI_SECRET_KEY", "dev-secret-change-me")
     bootstrap_admin_username: str = os.getenv("XIAOBAI_BOOTSTRAP_ADMIN_USERNAME", "admin")
     bootstrap_admin_password: str = os.getenv("XIAOBAI_BOOTSTRAP_ADMIN_PASSWORD", "ChangeMe123!")

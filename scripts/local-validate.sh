@@ -12,6 +12,7 @@ text = p.read_text(encoding='utf-8')
 text = text.replace('XIAOBAI_SECRET_KEY=change-this-secret-before-production', 'XIAOBAI_SECRET_KEY=local-validation-secret')
 p.write_text(text, encoding='utf-8')
 PY
+export XIAOBAI_HOST_DATA_DIR="$ROOT/deploy/data"
 
 docker compose --env-file deploy/.env -f deploy/docker-compose.yml build
 

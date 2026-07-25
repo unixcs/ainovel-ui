@@ -29,6 +29,11 @@ class EngineManager:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def host_work_dir(self, work_id: str) -> Path:
+        path = settings.host_data_dir / "works" / work_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def output_root(self, work_id: str) -> Path:
         work_dir = self.work_dir(work_id)
         if settings.engine_mode == "ainovel":
@@ -193,10 +198,15 @@ class EngineManager:
         if not self._docker:
             raise RuntimeError("Docker daemon 不可用，无法启动 ainovel-cli")
         work_dir = self.work_dir(work_id)
+        host_work_dir = self.host_work_dir(work_id)
         config_dir = work_dir / "config"
         workspace_dir = work_dir / "workspace"
+        host_config_dir = host_work_dir / "config"
+        host_workspace_dir = host_work_dir / "workspace"
         config_dir.mkdir(parents=True, exist_ok=True)
         workspace_dir.mkdir(parents=True, exist_ok=True)
+        host_config_dir.mkdir(parents=True, exist_ok=True)
+        host_workspace_dir.mkdir(parents=True, exist_ok=True)
         self._write_ainovel_config(work_id, config_dir / "config.json")
         container_name = f"xiaobai-{run_id}"
         command = [] if resume else ["--headless", "--prompt", prompt]
@@ -206,8 +216,8 @@ class EngineManager:
             "detach": True,
             "working_dir": "/workspace",
             "volumes": {
-                str(config_dir.resolve()): {"bind": "/root/.ainovel", "mode": "rw"},
-                str(workspace_dir.resolve()): {"bind": "/workspace", "mode": "rw"},
+                str(host_config_dir.resolve()): {"bind": "/root/.ainovel", "mode": "rw"},
+                str(host_workspace_dir.resolve()): {"bind": "/workspace", "mode": "rw"},
             },
             "labels": {
                 "com.xiaobai.app": "xiaobai-one",

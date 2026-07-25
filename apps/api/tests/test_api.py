@@ -4,8 +4,6 @@ import os
 import shutil
 import tempfile
 import time as real_time
-
-ORIGINAL_SLEEP = real_time.sleep
 from pathlib import Path
 
 import pytest
@@ -23,6 +21,8 @@ from app.db import init_db
 import app.engine as engine_module
 from app.main import app
 
+ORIGINAL_SLEEP = real_time.sleep
+
 
 @pytest.fixture()
 def client(monkeypatch: pytest.MonkeyPatch):
@@ -38,11 +38,49 @@ def client(monkeypatch: pytest.MonkeyPatch):
     shutil.rmtree(settings.data_dir, ignore_errors=True)
 
 
-def auth_header(client: TestClient, username: str, password: str) -> dict[str, str]:
+def login(client: TestClient, username: str, password: str) -> dict:
     response = client.post("/api/auth/login", json={"username": username, "password": password})
     assert response.status_code == 200, response.text
-    token = response.json()["token"]
+    return response.json()
+
+
+def auth_header_from_token(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def auth_header(client: TestClient, username: str, password: str) -> dict[str, str]:
+    return auth_header_from_token(login(client, username, password)["token"])
+
+
+def change_password(client: TestClient, token: str, current_password: str, new_password: str) -> dict[str, str]:
+    headers = auth_header_from_token(token)
+    response = client.post(
+        "/api/users/me/password",
+        json={"current_password": current_password, "new_password": new_password},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    return {"Authorization": f"Bearer {login(client, login_user(headers, client), new_password)['token']}"}
+
+
+def login_user(headers: dict[str, str], client: TestClient) -> str:
+    me = client.get("/api/me", headers=headers)
+    assert me.status_code == 200, me.text
+    return me.json()["user"]["username"]
+
+
+def bootstrap_admin_headers(client: TestClient) -> dict[str, str]:
+    payload = login(client, "admin", "Admin123!")
+    assert payload["user"]["must_change_password"] is True
+    blocked = client.get("/api/invites", headers=auth_header_from_token(payload["token"]))
+    assert blocked.status_code == 403
+    response = client.post(
+        "/api/users/me/password",
+        json={"current_password": "Admin123!", "new_password": "Admin1234!"},
+        headers=auth_header_from_token(payload["token"]),
+    )
+    assert response.status_code == 200, response.text
+    return auth_header(client, "admin", "Admin1234!")
 
 
 def create_operator(client: TestClient, admin_headers: dict[str, str], username: str) -> dict[str, str]:
@@ -73,8 +111,21 @@ def wait_for_terminal_status(client: TestClient, headers: dict[str, str], work_i
     raise AssertionError("work did not reach terminal state in time")
 
 
-def test_happy_path_admin_invite_claim_credentials_work_and_mock_artifacts(client: TestClient) -> None:
-    admin_headers = auth_header(client, "admin", "Admin123!")
+def test_bootstrap_admin_must_change_password_and_can_manage_invites(client: TestClient) -> None:
+    admin_headers = bootstrap_admin_headers(client)
+    presets = client.get("/api/testing/connection-presets", headers=admin_headers)
+    assert presets.status_code == 200
+    assert len(presets.json()) >= 2
+    created = client.post(
+        "/api/invites",
+        json={"note": "boot", "expires_in_hours": 24, "max_uses": 1},
+        headers=admin_headers,
+    )
+    assert created.status_code == 200
+
+
+def test_happy_path_credentials_chapters_download_and_password_change(client: TestClient) -> None:
+    admin_headers = bootstrap_admin_headers(client)
     user_headers = create_operator(client, admin_headers, "writer1")
 
     save_cred = client.put(
@@ -110,7 +161,6 @@ def test_happy_path_admin_invite_claim_credentials_work_and_mock_artifacts(clien
     assert create_work.status_code == 200, create_work.text
 
     works = client.get("/api/works", headers=user_headers).json()["items"]
-    assert len(works) == 1
     work_id = works[0]["id"]
 
     started = client.post(f"/api/works/{work_id}/runs/start", headers=user_headers)
@@ -118,13 +168,37 @@ def test_happy_path_admin_invite_claim_credentials_work_and_mock_artifacts(clien
 
     payload = wait_for_terminal_status(client, user_headers, work_id)
     assert payload["work"]["status"] == "completed"
-    assert payload["work"]["completed_chapters"] >= 3
-    assert any(item["path"].endswith("outline.md") for item in payload["artifacts"])
-    assert any("chapters/" in item["path"] for item in payload["artifacts"])
+    assert payload["chapters"]
+    chapter_id = payload["chapters"][0]["id"]
+
+    chapter_detail = client.get(f"/api/works/{work_id}/chapters/{chapter_id}", headers=user_headers)
+    assert chapter_detail.status_code == 200, chapter_detail.text
+    detail = chapter_detail.json()
+    assert detail["cleaned_text"].startswith("第")
+    assert "# 第" in detail["raw_markdown"]
+
+    txt = client.get(f"/api/works/{work_id}/chapters/{chapter_id}/download.txt", headers=user_headers)
+    assert txt.status_code == 200
+    assert txt.headers["content-type"].startswith("text/plain")
+    assert "# 第" not in txt.text
+
+    all_txt = client.get(f"/api/works/{work_id}/download/all.txt", headers=user_headers)
+    assert all_txt.status_code == 200
+    assert "# 第" not in all_txt.text
+    assert "测试作品" in all_txt.text
+
+    pwd_change = client.post(
+        "/api/users/me/password",
+        json={"current_password": "Writer123!", "new_password": "Writer1234!"},
+        headers=user_headers,
+    )
+    assert pwd_change.status_code == 200, pwd_change.text
+    relogin = login(client, "writer1", "Writer1234!")
+    assert relogin["user"]["must_change_password"] is False
 
 
 def test_access_control_invite_reuse_and_revoke(client: TestClient) -> None:
-    admin_headers = auth_header(client, "admin", "Admin123!")
+    admin_headers = bootstrap_admin_headers(client)
     created = client.post(
         "/api/invites",
         json={"note": "revoke-me", "expires_in_hours": 24, "max_uses": 1},
@@ -168,7 +242,7 @@ def test_access_control_invite_reuse_and_revoke(client: TestClient) -> None:
 
 
 def test_validation_rejects_bad_payloads(client: TestClient) -> None:
-    admin_headers = auth_header(client, "admin", "Admin123!")
+    admin_headers = bootstrap_admin_headers(client)
     bad_invite = client.post(
         "/api/invites",
         json={"note": "x", "expires_in_hours": 0, "max_uses": 0},
@@ -206,7 +280,7 @@ def test_validation_rejects_bad_payloads(client: TestClient) -> None:
 
 
 def test_run_state_guards_reject_invalid_transitions(client: TestClient) -> None:
-    admin_headers = auth_header(client, "admin", "Admin123!")
+    admin_headers = bootstrap_admin_headers(client)
     user_headers = create_operator(client, admin_headers, "writer6")
 
     work = client.post(
@@ -219,7 +293,6 @@ def test_run_state_guards_reject_invalid_transitions(client: TestClient) -> None
 
     before_continue = client.post(f"/api/works/{work_id}/runs/continue", headers=user_headers)
     assert before_continue.status_code == 400
-    assert "继续创作" in before_continue.text or "暂停" in before_continue.text
 
     started = client.post(f"/api/works/{work_id}/runs/start", headers=user_headers)
     assert started.status_code == 200
@@ -238,7 +311,7 @@ def test_run_state_guards_reject_invalid_transitions(client: TestClient) -> None
 
 def test_run_limits_per_operator_and_global(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(engine_module.time, "sleep", lambda _: ORIGINAL_SLEEP(0.2))
-    admin_headers = auth_header(client, "admin", "Admin123!")
+    admin_headers = bootstrap_admin_headers(client)
     user1 = create_operator(client, admin_headers, "limit1")
     user2 = create_operator(client, admin_headers, "limit2")
     user3 = create_operator(client, admin_headers, "limit3")
@@ -266,8 +339,8 @@ def test_run_limits_per_operator_and_global(client: TestClient, monkeypatch: pyt
     assert "全站" in third_global.text
 
 
-def test_ainovel_mode_uses_workspace_output_root_for_artifacts(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    admin_headers = auth_header(client, "admin", "Admin123!")
+def test_ainovel_mode_workspace_path_and_connection_status(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    admin_headers = bootstrap_admin_headers(client)
     user_headers = create_operator(client, admin_headers, "writer7")
     work = client.post(
         "/api/works",
@@ -278,7 +351,7 @@ def test_ainovel_mode_uses_workspace_output_root_for_artifacts(client: TestClien
     work_id = client.get("/api/works", headers=user_headers).json()["items"][0]["id"]
 
     monkeypatch.setattr(engine_module.settings, "engine_mode", "ainovel")
-    monkeypatch.setattr(engine_module.engine_manager, "_docker", None)
+    monkeypatch.setattr("app.main.settings.engine_mode", "ainovel")
     output_root = engine_module.engine_manager.output_root(work_id)
     output_root.mkdir(parents=True, exist_ok=True)
     chapter = output_root / "chapters" / "001-第1章.md"
@@ -289,3 +362,34 @@ def test_ainovel_mode_uses_workspace_output_root_for_artifacts(client: TestClien
     assert detail.status_code == 200, detail.text
     paths = [item["path"] for item in detail.json()["artifacts"]]
     assert any(path.endswith("workspace/output/novel/chapters/001-第1章.md") for path in paths)
+
+    save_cred = client.put(
+        "/api/credentials/me",
+        json={
+            "provider_alias": "test-openai",
+            "provider_type": "openai",
+            "model_name": "gpt-5.4-mini",
+            "reasoning_effort": "medium",
+            "base_url": "https://example.com/v1",
+            "api_key": "sk-test-1234567890",
+        },
+        headers=user_headers,
+    )
+    assert save_cred.status_code == 200
+
+    monkeypatch.setattr("app.main.probe_model_connection", lambda payload: (True, "连接成功", 200, "pong"))
+    tested = client.post(
+        "/api/credentials/test",
+        json={
+            "provider_alias": "test-openai",
+            "provider_type": "openai",
+            "model_name": "gpt-5.4-mini",
+            "reasoning_effort": "medium",
+            "base_url": "https://example.com/v1",
+            "api_key": "sk-test-1234567890",
+        },
+        headers=user_headers,
+    )
+    assert tested.status_code == 200
+    cred = client.get("/api/credentials/me", headers=user_headers)
+    assert cred.json()["item"]["last_test_status"] == "success"

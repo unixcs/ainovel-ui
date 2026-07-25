@@ -21,6 +21,7 @@ dist/
 *.sqlite3
 *.log
 /data/
+deploy/data/
 /tmp/
 
 # Build
