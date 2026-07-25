@@ -2,6 +2,31 @@ import { useEffect, useMemo, useState } from 'react'
 
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 
+function formatApiError(data, status) {
+  if (!data) return `请求失败: ${status}`
+  if (typeof data === 'string') return data
+  if (Array.isArray(data)) {
+    return data.map((item) => formatApiError(item, status)).join('；')
+  }
+  if (Array.isArray(data.detail)) {
+    return data.detail
+      .map((item) => {
+        if (typeof item === 'string') return item
+        const loc = Array.isArray(item.loc) ? item.loc.join('.') : ''
+        const msg = item.msg || item.message || JSON.stringify(item)
+        return loc ? `${loc}: ${msg}` : msg
+      })
+      .join('；')
+  }
+  if (typeof data.detail === 'string') return data.detail
+  if (typeof data.message === 'string') return data.message
+  try {
+    return JSON.stringify(data, null, 2)
+  } catch {
+    return String(data)
+  }
+}
+
 async function api(path, options = {}, token) {
   const headers = { ...(options.headers || {}) }
   if (!(options.body instanceof FormData) && !headers['Content-Type']) {
@@ -13,7 +38,7 @@ async function api(path, options = {}, token) {
   const text = await response.text()
   const data = contentType.includes('application/json') ? (text ? JSON.parse(text) : null) : text
   if (!response.ok) {
-    throw new Error(data?.detail || data?.message || data || `请求失败: ${response.status}`)
+    throw new Error(formatApiError(data, response.status))
   }
   return data
 }
