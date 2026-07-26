@@ -18,10 +18,20 @@ cd /mnt/demo/ainovel-ui
 
 ```bash
 sudo mkdir -p /opt/xiaobai-one
-sudo rsync -av --delete /mnt/demo/ainovel-ui/ /opt/xiaobai-one/
+sudo rsync -av --delete \
+  --exclude '.git/' \
+  --exclude 'deploy/.env' \
+  --exclude 'deploy/data/' \
+  --exclude 'apps/api/.venv/' \
+  --exclude 'apps/web/node_modules/' \
+  --exclude 'apps/web/dist/' \
+  /mnt/demo/ainovel-ui/ /opt/xiaobai-one/
 cd /opt/xiaobai-one/deploy
-cp .env.example .env
-# 编辑 .env，至少更换 XIAOBAI_SECRET_KEY 和管理员密码
+# 首次部署才创建 .env；升级部署必须保留现有 deploy/.env 和 deploy/data。
+test -f .env || cp .env.example .env
+# 编辑 .env，至少更换 XIAOBAI_SECRET_KEY 和管理员密码。
+# 生产真实生成必须明确设置 XIAOBAI_ENGINE_MODE=ainovel。
+# 不要直接执行 docker compose up；deploy.sh 会把数据目录解析为宿主机绝对路径。
 ./deploy.sh
 ```
 

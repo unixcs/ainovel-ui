@@ -16,7 +16,7 @@ from .config import settings
 from .content import list_chapters, load_chapter_by_id, render_all_chapters_txt, render_chapter_txt
 from .db import init_db, json_dumps, json_loads, new_id, transaction, utcnow
 from .engine import engine_manager
-from .security import decode_token, encrypt_text, hash_password, issue_token, verify_password
+from .security import decode_token, decrypt_text, encrypt_text, hash_password, issue_token, verify_password
 
 STARTABLE_STATUSES = {"idle"}
 CONTINUABLE_STATUSES = {"paused", "failed", "quota_stop"}
@@ -29,6 +29,7 @@ OPENAI_COMPATIBLE_TYPES = {None, "", "openai", "openrouter", "deepseek", "qwen",
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    engine_manager.recover_active_runs()
     yield
 
 
@@ -36,7 +37,7 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.cors_origin] if settings.cors_origin != "*" else ["*"],
-    allow_credentials=True,
+    allow_credentials=settings.cors_origin != "*",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -200,6 +201,8 @@ class ChapterSummaryView(BaseModel):
     filename: str
     size: int
     updated_at: str
+    character_count: int
+    paragraph_count: int
 
 
 class RunView(BaseModel):
@@ -231,8 +234,8 @@ class ConnectionPresetView(BaseModel):
     provider_alias: str
     provider_type: str
     base_url: str
-    api_key: str
     model_name: str
+    note: str
 
 
 class HealthView(BaseModel):
@@ -287,6 +290,8 @@ class ChapterDetailView(BaseModel):
     raw_markdown: str
     size: int
     updated_at: str
+    character_count: int
+    paragraph_count: int
 
 
 class ChapterListView(BaseModel):
@@ -295,22 +300,15 @@ class ChapterListView(BaseModel):
 
 TEST_CONNECTION_PRESETS = [
     {
-        "label": "SenseNova Fast",
-        "provider_alias": "sensenova",
-        "provider_type": "openai",
-        "base_url": "https://token.sensenova.cn/v1",
-        "api_key": "sk-L24KsCISoxnStAhiguzxyW4YcxVsHT6t",
-        "model_name": "sensenova-u1-fast",
-    },
-    {
         "label": "SenseNova Flash Lite",
         "provider_alias": "sensenova",
         "provider_type": "openai",
         "base_url": "https://token.sensenova.cn/v1",
-        "api_key": "sk-L24KsCISoxnStAhiguzxyW4YcxVsHT6t",
         "model_name": "sensenova-6.7-flash-lite",
+        "note": "仅填充公开连接参数；API Key 需由操作者自行输入。",
     },
 ]
+
 
 
 def now_plus_hours(hours: int) -> str:
@@ -393,9 +391,11 @@ def ensure_run_capability(conn, user_id: str, work_id: str):
 def require_credential_if_needed(conn, user_id: str) -> None:
     if settings.engine_mode != "ainovel":
         return
-    cred = conn.execute("SELECT 1 FROM credentials WHERE user_id=?", (user_id,)).fetchone()
+    cred = conn.execute("SELECT last_test_status FROM credentials WHERE user_id=?", (user_id,)).fetchone()
     if not cred:
         raise HTTPException(status_code=400, detail="请先保存模型凭证")
+    if cred["last_test_status"] != "success":
+        raise HTTPException(status_code=400, detail="请先对已保存的模型凭证执行连接测试并确认成功")
 
 
 def build_output_root(work_id: str):
@@ -437,6 +437,8 @@ def list_chapter_views(work_id: str) -> list[dict[str, Any]]:
             "filename": item.filename,
             "size": item.size,
             "updated_at": item.updated_at,
+            "character_count": item.character_count,
+            "paragraph_count": item.paragraph_count,
         }
         for item in list_chapters(output_root)
     ]
@@ -645,7 +647,8 @@ def save_credential(payload: CredentialPayload, user: Annotated[dict[str, Any], 
             conn.execute(
                 """
                 UPDATE credentials SET provider_alias=?, provider_type=?, model_name=?, reasoning_effort=?, base_url=?,
-                api_key_encrypted=?, masked_api_key=?, updated_at=? WHERE user_id=?
+                api_key_encrypted=?, masked_api_key=?, updated_at=?, last_test_status=NULL,
+                last_test_message=NULL, last_tested_at=NULL WHERE user_id=?
                 """,
                 (payload.provider_alias, payload.provider_type, payload.model_name, payload.reasoning_effort, payload.base_url, encrypted, masked, now, user["id"]),
             )
@@ -675,12 +678,24 @@ def test_credential(payload: CredentialPayload, user: Annotated[dict[str, Any], 
     except Exception as exc:
         message = f"连接失败：{exc}"
     with transaction() as conn:
-        row = conn.execute("SELECT id FROM credentials WHERE user_id=?", (user["id"],)).fetchone()
-        if row:
+        row = conn.execute("SELECT * FROM credentials WHERE user_id=?", (user["id"],)).fetchone()
+        matches_saved = bool(
+            row
+            and row["provider_alias"] == payload.provider_alias
+            and (row["provider_type"] or None) == (payload.provider_type or None)
+            and row["model_name"] == payload.model_name
+            and row["reasoning_effort"] == payload.reasoning_effort
+            and (row["base_url"] or None) == (payload.base_url or None)
+            and decrypt_text(row["api_key_encrypted"]) == payload.api_key
+        )
+        if matches_saved:
+            now = utcnow()
             conn.execute(
                 "UPDATE credentials SET last_test_status=?, last_test_message=?, last_tested_at=?, updated_at=? WHERE user_id=?",
-                (status, message, utcnow(), utcnow(), user["id"]),
+                (status, message, now, now, user["id"]),
             )
+        elif row:
+            message = f"{message}；当前测试参数尚未保存，因此未更新已保存配置的连接状态"
     return {
         "ok": status == "success",
         "message": message,
@@ -803,6 +818,8 @@ def get_chapter_detail(work_id: str, chapter_id: str, user: Annotated[dict[str, 
         "raw_markdown": raw,
         "size": item.size,
         "updated_at": item.updated_at,
+        "character_count": item.character_count,
+        "paragraph_count": item.paragraph_count,
     }
 
 
@@ -823,7 +840,10 @@ def download_chapter_txt(work_id: str, chapter_id: str, user: Annotated[dict[str
 def download_all_txt(work_id: str, user: Annotated[dict[str, Any], Depends(current_user)]):
     with transaction() as conn:
         work = get_owned_work(conn, user["id"], work_id)
-    txt = render_all_chapters_txt(build_output_root(work_id), work["title"])
+    output_root = build_output_root(work_id)
+    if not list_chapters(output_root):
+        raise HTTPException(status_code=404, detail="暂无可导出的章节")
+    txt = render_all_chapters_txt(output_root, work["title"])
     headers = build_download_headers(f"{work["title"].replace("/", "-")}-all.txt")
     return PlainTextResponse(txt, headers=headers)
 
@@ -862,7 +882,8 @@ def start_work(work_id: str, user: Annotated[dict[str, Any], Depends(current_use
                 (str(exc), utcnow(), work_id),
             )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return ActionResponse(ok=True, message="创作运行已启动")
+    message = "真实小说引擎已启动" if settings.engine_mode == "ainovel" else "模拟验收运行已启动（不会调用大模型）"
+    return ActionResponse(ok=True, message=message)
 
 
 @app.post("/api/works/{work_id}/runs/pause", response_model=ActionResponse)
@@ -872,7 +893,10 @@ def pause_work(work_id: str, user: Annotated[dict[str, Any], Depends(current_use
         if work["status"] not in PAUSABLE_STATUSES or not work["active_run_id"]:
             raise HTTPException(status_code=400, detail="当前没有可暂停的活跃运行")
         run_id = work["active_run_id"]
-    engine_manager.pause(run_id)
+    try:
+        engine_manager.pause(run_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return ActionResponse(ok=True, message="暂停请求已发送")
 
 

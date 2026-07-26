@@ -16,8 +16,9 @@ os.environ["XIAOBAI_SECRET_KEY"] = "test-secret-key"
 os.environ["XIAOBAI_BOOTSTRAP_ADMIN_USERNAME"] = "admin"
 os.environ["XIAOBAI_BOOTSTRAP_ADMIN_PASSWORD"] = "Admin123!"
 
-from app.config import settings
-from app.db import init_db
+from app.config import Settings, settings
+from app.content import chapter_title_from_markdown
+from app.db import init_db, json_loads, new_id, transaction, utcnow
 import app.engine as engine_module
 from app.main import app
 
@@ -115,7 +116,9 @@ def test_bootstrap_admin_must_change_password_and_can_manage_invites(client: Tes
     admin_headers = bootstrap_admin_headers(client)
     presets = client.get("/api/testing/connection-presets", headers=admin_headers)
     assert presets.status_code == 200
-    assert len(presets.json()) >= 2
+    assert presets.json()
+    assert all("api_key" not in item for item in presets.json())
+    assert all(item["model_name"] != "sensenova-u1-fast" for item in presets.json())
     created = client.post(
         "/api/invites",
         json={"note": "boot", "expires_in_hours": 24, "max_uses": 1},
@@ -393,3 +396,283 @@ def test_ainovel_mode_workspace_path_and_connection_status(client: TestClient, m
     assert tested.status_code == 200
     cred = client.get("/api/credentials/me", headers=user_headers)
     assert cred.json()["item"]["last_test_status"] == "success"
+
+
+
+def test_mock_respects_target_and_returns_full_live_chapter(client: TestClient) -> None:
+    admin_headers = bootstrap_admin_headers(client)
+    user_headers = create_operator(client, admin_headers, "targetone")
+    created = client.post(
+        "/api/works",
+        json={"title": "单章验收", "prompt": "写一个完整开篇", "target_chapters": 1},
+        headers=user_headers,
+    )
+    assert created.status_code == 200, created.text
+    work_id = client.get("/api/works", headers=user_headers).json()["items"][0]["id"]
+    started = client.post(f"/api/works/{work_id}/runs/start", headers=user_headers)
+    assert started.status_code == 200
+    assert "模拟" in started.json()["message"]
+
+    payload = wait_for_terminal_status(client, user_headers, work_id)
+    assert payload["work"]["completed_chapters"] == 1
+    assert len(payload["chapters"]) == 1
+    summary = payload["chapters"][0]
+    assert summary["character_count"] > 100
+    assert summary["paragraph_count"] >= 5
+
+    chapter_url = f"/api/works/{work_id}/chapters/{summary['id']}"
+    first = client.get(chapter_url, headers=user_headers)
+    assert first.status_code == 200
+    chapter_path = engine_module.engine_manager.output_root(work_id) / "chapters" / summary["filename"]
+    chapter_path.write_text(chapter_path.read_text(encoding="utf-8") + "\n\n这是实时追加的完整段落。", encoding="utf-8")
+    second = client.get(chapter_url, headers=user_headers)
+    assert second.status_code == 200
+    assert "实时追加" in second.json()["cleaned_text"]
+    assert second.json()["size"] > first.json()["size"]
+
+
+def test_empty_export_and_unsaved_connection_result_fail_closed(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    admin_headers = bootstrap_admin_headers(client)
+    user_headers = create_operator(client, admin_headers, "failclosed")
+    client.post(
+        "/api/works",
+        json={"title": "空作品", "prompt": "尚未运行", "target_chapters": 1},
+        headers=user_headers,
+    )
+    work_id = client.get("/api/works", headers=user_headers).json()["items"][0]["id"]
+    empty_export = client.get(f"/api/works/{work_id}/download/all.txt", headers=user_headers)
+    assert empty_export.status_code == 404
+    assert "暂无" in empty_export.text
+
+    saved_payload = {
+        "provider_alias": "saved",
+        "provider_type": "openai",
+        "model_name": "saved-model",
+        "reasoning_effort": "medium",
+        "base_url": "https://saved.example/v1",
+        "api_key": "sk-saved-123456",
+    }
+    assert client.put("/api/credentials/me", json=saved_payload, headers=user_headers).status_code == 200
+    monkeypatch.setattr("app.main.probe_model_connection", lambda payload: (True, "连接成功", 200, "pong"))
+    other_payload = {**saved_payload, "model_name": "different-model"}
+    tested = client.post("/api/credentials/test", json=other_payload, headers=user_headers)
+    assert tested.status_code == 200
+    assert "尚未保存" in tested.json()["message"]
+    stored = client.get("/api/credentials/me", headers=user_headers).json()["item"]
+    assert stored["last_test_status"] is None
+
+    monkeypatch.setattr(engine_module.settings, "engine_mode", "ainovel")
+    monkeypatch.setattr("app.main.settings.engine_mode", "ainovel")
+    blocked = client.post(f"/api/works/{work_id}/runs/start", headers=user_headers)
+    assert blocked.status_code == 400
+    assert "连接测试" in blocked.text
+
+
+class StubThread:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.started = False
+
+    def start(self) -> None:
+        self.started = True
+
+
+class FakeContainers:
+    def __init__(self, container=None):
+        self.container = container
+        self.run_calls: list[dict] = []
+
+    def run(self, *args, **kwargs):
+        self.run_calls.append({"args": args, "kwargs": kwargs})
+        return self.container
+
+    def get(self, name: str):
+        if self.container is None:
+            raise engine_module.NotFound("missing")
+        self.container.requested_name = name
+        return self.container
+
+
+class FakeDocker:
+    def __init__(self, container=None):
+        self.containers = FakeContainers(container)
+
+
+class FakeContainer:
+    def __init__(self, *, fail_stop=False, fail_kill=False, fail_remove=False):
+        self.attrs = {"State": {"Status": "running", "ExitCode": 0}}
+        self.fail_stop = fail_stop
+        self.fail_kill = fail_kill
+        self.fail_remove = fail_remove
+        self.stop_calls = 0
+        self.kill_calls = 0
+        self.remove_calls = 0
+        self.requested_name = None
+
+    def reload(self) -> None:
+        return None
+
+    def stop(self, timeout=10) -> None:
+        self.stop_calls += 1
+        if self.fail_stop:
+            raise engine_module.DockerException("stop unavailable")
+        self.attrs["State"] = {"Status": "exited", "ExitCode": 0}
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        if self.fail_kill:
+            raise engine_module.DockerException("kill unavailable")
+        self.attrs["State"] = {"Status": "exited", "ExitCode": 137}
+
+    def remove(self) -> None:
+        self.remove_calls += 1
+        if self.fail_remove:
+            raise engine_module.DockerException("remove unavailable")
+
+    def logs(self, tail=80) -> bytes:
+        return b"fake logs"
+
+
+def insert_active_run(work_id: str, user_id: str, *, container_name: str | None = "xiaobai-test") -> str:
+    run_id = new_id("run")
+    now = utcnow()
+    with transaction() as conn:
+        conn.execute(
+            "INSERT INTO runs (id, work_id, user_id, status, mode, container_name, pid, meta_json, started_at, ended_at, created_at, updated_at) VALUES (?, ?, ?, 'running', 'ainovel', ?, NULL, '{}', ?, NULL, ?, ?)",
+            (run_id, work_id, user_id, container_name, now, now, now),
+        )
+        conn.execute(
+            "UPDATE works SET status='running', current_phase='写作', current_flow='writing', active_run_id=?, updated_at=? WHERE id=?",
+            (run_id, now, work_id),
+        )
+    return run_id
+
+
+def create_real_engine_fixture(client: TestClient, username: str, *, target_chapters: int = 1) -> tuple[dict[str, str], str, str]:
+    admin_headers = bootstrap_admin_headers(client)
+    user_headers = create_operator(client, admin_headers, username)
+    assert client.put(
+        "/api/credentials/me",
+        json={
+            "provider_alias": "test-openai",
+            "provider_type": "openai",
+            "model_name": "test-model",
+            "reasoning_effort": "medium",
+            "base_url": "https://example.com/v1",
+            "api_key": "sk-private-test-value",
+        },
+        headers=user_headers,
+    ).status_code == 200
+    assert client.post(
+        "/api/works",
+        json={"title": f"真实引擎-{username}", "prompt": "验证真实引擎边界", "target_chapters": target_chapters},
+        headers=user_headers,
+    ).status_code == 200
+    work_id = client.get("/api/works", headers=user_headers).json()["items"][0]["id"]
+    user_id = client.get("/api/me", headers=user_headers).json()["user"]["id"]
+    return user_headers, user_id, work_id
+
+
+def test_ainovel_start_is_headless_limited_and_resume_safe(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, user_id, work_id = create_real_engine_fixture(client, "enginestart")
+    monkeypatch.setattr(engine_module.settings, "engine_mode", "ainovel")
+    fake_docker = FakeDocker(FakeContainer())
+    monkeypatch.setattr(engine_module.engine_manager, "_docker", fake_docker)
+    monkeypatch.setattr(engine_module.threading, "Thread", StubThread)
+
+    first_run = insert_active_run(work_id, user_id, container_name=None)
+    engine_module.engine_manager._start_ainovel(work_id, first_run, "fresh prompt", resume=False)
+    first = fake_docker.containers.run_calls[-1]["kwargs"]
+    assert first["command"] == ["--headless", "--prompt", "fresh prompt"]
+    assert first["mem_limit"] == settings.ainovel_memory
+    assert first["nano_cpus"] == int(settings.ainovel_cpus * 1_000_000_000)
+    assert first["pids_limit"] == settings.ainovel_pids_limit
+    assert first["labels"]["com.xiaobai.work_id"] == work_id
+
+    config_path = settings.works_dir / work_id / "config" / "config.json"
+    assert config_path.exists()
+    assert config_path.stat().st_mode & 0o777 == 0o600
+    assert config_path.parent.stat().st_mode & 0o777 == 0o700
+    assert "sk-private-test-value" in config_path.read_text(encoding="utf-8")
+
+    with transaction() as conn:
+        conn.execute("UPDATE runs SET status='paused' WHERE id=?", (first_run,))
+        conn.execute("UPDATE works SET status='paused', active_run_id=NULL WHERE id=?", (work_id,))
+    resume_run = insert_active_run(work_id, user_id, container_name=None)
+    engine_module.engine_manager._start_ainovel(work_id, resume_run, "ignored prompt", resume=True)
+    resumed = fake_docker.containers.run_calls[-1]["kwargs"]
+    assert resumed["command"] == ["--headless"]
+    engine_module.engine_manager._monitors.clear()
+
+
+def test_ainovel_target_stop_retries_fail_closed_then_completes(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, user_id, work_id = create_real_engine_fixture(client, "targetstop", target_chapters=1)
+    monkeypatch.setattr(engine_module.settings, "engine_mode", "ainovel")
+    chapter_dir = engine_module.engine_manager.output_root(work_id) / "chapters"
+    chapter_dir.mkdir(parents=True, exist_ok=True)
+    (chapter_dir / "001-第1章.md").write_text("# 第1章\n\n完整正文。", encoding="utf-8")
+    run_id = insert_active_run(work_id, user_id)
+    container = FakeContainer(fail_stop=True, fail_kill=True)
+    monkeypatch.setattr(engine_module.engine_manager, "_docker", FakeDocker(container))
+
+    engine_module.engine_manager.sync_work(work_id)
+    with transaction() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        work = conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
+    assert run["status"] == "running"
+    assert json_loads(run["meta_json"])["target_stop_error"]
+    assert work["status"] == "running"
+    assert work["current_flow"] == "stopping"
+    assert work["active_run_id"] == run_id
+    assert container.stop_calls == 1 and container.kill_calls == 1
+    assert container.remove_calls == 0
+
+    container.fail_stop = False
+    container.fail_kill = False
+    engine_module.engine_manager.sync_work(work_id)
+    with transaction() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        work = conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
+    assert run["status"] == "completed"
+    assert json_loads(run["meta_json"]) == {"stopped_at_target": 1}
+    assert work["status"] == "completed"
+    assert work["completed_chapters"] == 1
+    assert work["active_run_id"] is None
+    assert container.remove_calls == 1
+
+
+def test_chapter_title_falls_back_for_untitled_prose() -> None:
+    prose = "清晨七点四十，林维站在档案中心的地面入口。\n\n这是正文。"
+    assert chapter_title_from_markdown(prose, "第1章") == "第1章"
+    assert chapter_title_from_markdown("第一章 编号不存在\n\n这是正文。", "第1章") == "第一章 编号不存在"
+    assert chapter_title_from_markdown("# 第一章 编号不存在\n\n这是正文。", "第1章") == "第一章 编号不存在"
+
+
+
+def test_ainovel_host_data_dir_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("XIAOBAI_HOST_DATA_DIR", raising=False)
+    with pytest.raises(ValueError, match="XIAOBAI_HOST_DATA_DIR"):
+        Settings(engine_mode="ainovel", host_data_dir=None)
+    with pytest.raises(ValueError, match="绝对路径"):
+        Settings(engine_mode="ainovel", host_data_dir=Path("relative-data"))
+
+    configured = Settings(engine_mode="ainovel", host_data_dir=tmp_path.resolve())
+    assert configured.host_data_dir == tmp_path.resolve()
+    mock = Settings(engine_mode="mock", data_dir=tmp_path, host_data_dir=None)
+    assert mock.host_data_dir == tmp_path
+
+def test_ainovel_recovery_fails_stale_runs_when_docker_is_unavailable(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, user_id, work_id = create_real_engine_fixture(client, "recoverfail")
+    monkeypatch.setattr(engine_module.settings, "engine_mode", "ainovel")
+    run_id = insert_active_run(work_id, user_id)
+    monkeypatch.setattr(engine_module.engine_manager, "_docker", None)
+
+    engine_module.engine_manager.recover_active_runs()
+    with transaction() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        work = conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
+    assert run["status"] == "failed"
+    assert "Docker" in json_loads(run["meta_json"])["error"]
+    assert work["status"] == "failed"
+    assert work["active_run_id"] is None

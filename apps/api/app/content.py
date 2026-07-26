@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -14,6 +15,8 @@ class ChapterItem:
     path: Path
     size: int
     updated_at: str
+    character_count: int
+    paragraph_count: int
 
 
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*", re.MULTILINE)
@@ -29,10 +32,12 @@ HR_RE = re.compile(r"^\s*([-*_]\s*){3,}$", re.MULTILINE)
 MULTI_BLANK_RE = re.compile(r"\n{3,}")
 FILENAME_RE = re.compile(r"^(\d+)[-_]?(.*)$")
 TITLE_RE = re.compile(r"^\s*#\s+(.+)$", re.MULTILINE)
+CHAPTER_TITLE_LINE_RE = re.compile(r"^(?:第[零〇一二三四五六七八九十百千万两0-9]+[章节回卷篇].*|chapter\s+\d+.*)$", re.IGNORECASE)
+SUPPORTED_CHAPTER_SUFFIXES = {".md", ".markdown", ".txt"}
 
 
 def clean_markdown_text(markdown: str) -> str:
-    text = markdown.replace("\r\n", "\n").replace("\r", "\n")
+    text = markdown.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
     text = FENCE_RE.sub("\n", text)
     text = IMAGE_RE.sub(lambda m: m.group(1) or "", text)
     text = LINK_RE.sub(lambda m: m.group(1), text)
@@ -55,6 +60,9 @@ def chapter_title_from_markdown(markdown: str, fallback: str) -> str:
     match = TITLE_RE.search(markdown)
     if match:
         return clean_markdown_text(match.group(1)).strip() or fallback
+    first_line = next((line.strip() for line in markdown.splitlines() if line.strip()), "")
+    if first_line and len(first_line) <= 80 and CHAPTER_TITLE_LINE_RE.match(clean_markdown_text(first_line)):
+        return clean_markdown_text(first_line) or fallback
     return fallback
 
 
@@ -68,26 +76,43 @@ def parse_chapter_filename(name: str) -> tuple[int, str]:
     return 0, stem
 
 
+def text_metrics(text: str) -> tuple[int, int]:
+    compact = re.sub(r"\s+", "", text)
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    return len(compact), len(paragraphs)
+
+
 def list_chapters(output_root: Path) -> list[ChapterItem]:
     chapters_dir = output_root / "chapters"
     if not chapters_dir.exists():
         return []
     items: list[ChapterItem] = []
-    for path in sorted(chapters_dir.glob("*.md")):
+    for path in chapters_dir.iterdir():
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_CHAPTER_SUFFIXES:
+            continue
+        try:
+            stat = path.stat()
+            markdown = path.read_text(encoding="utf-8", errors="ignore")
+        except (FileNotFoundError, OSError):
+            # The engine may replace a chapter atomically while the UI is polling.
+            continue
         idx, fallback = parse_chapter_filename(path.name)
-        markdown = path.read_text(encoding="utf-8", errors="ignore")
+        title = chapter_title_from_markdown(markdown, fallback)
+        characters, paragraphs = text_metrics(clean_markdown_text(markdown))
         items.append(
             ChapterItem(
                 id=path.name,
                 index=idx,
-                title=chapter_title_from_markdown(markdown, fallback),
+                title=title,
                 filename=path.name,
                 path=path,
-                size=path.stat().st_size,
-                updated_at=str(path.stat().st_mtime),
+                size=stat.st_size,
+                updated_at=datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+                character_count=characters,
+                paragraph_count=paragraphs,
             )
         )
-    items.sort(key=lambda item: (item.index, item.filename))
+    items.sort(key=lambda item: (item.index <= 0, item.index, item.filename))
     return items
 
 
